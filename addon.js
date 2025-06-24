@@ -13,7 +13,7 @@ let wstToken = null;
 
 async function loginToWebshare() { if (wstToken) return true; try { console.log("Zahajuji přihlašování..."); const saltResponse = await axios.post('https://webshare.cz/api/salt/', new URLSearchParams({ 'username_or_email': WSHARE_USER })); const saltMatch = saltResponse.data.match(/<salt>(.*?)<\/salt>/); if (!saltMatch || !saltMatch[1]) throw new Error('Nepodařilo se získat sůl.'); const dynamicSalt = saltMatch[1]; const md5cryptedPassword = md5Crypt(WSHARE_PASSWORD, dynamicSalt); const sha1HashedPassword = crypto.createHash('sha1').update(md5cryptedPassword).digest('hex'); const digest = crypto.createHash('md5').update(`${WSHARE_USER}:Webshare:${WSHARE_PASSWORD}`).digest('hex'); const loginResponse = await axios.post('https://webshare.cz/api/login/', new URLSearchParams({ 'username_or_email': WSHARE_USER, 'password': sha1HashedPassword, 'digest': digest, 'keep_logged_in': '1' })); const tokenMatch = loginResponse.data.match(/<token>(.*?)<\/token>/); if (tokenMatch && tokenMatch[1]) { wstToken = tokenMatch[1]; console.log("✅ PŘIHLÁŠENÍ ÚSPĚŠNÉ!"); return true; } console.error("❌ Přihlášení selhalo.", loginResponse.data); return false; } catch (error) { console.error("❌ Kritická chyba při přihlašování:", error.message); return false; } }
 
-const manifest = { id: "cz.webshare.addon.cz.priority", version: "1.2.0", name: "Webshare CZ (CZ Priority)", description: "Doplněk pro Webshare.cz s prioritou pro CZ zdroje.", types: ["movie", "series"], catalogs: [], resources: ["stream"], idPrefixes: ["tt"] };
+const manifest = { id: "cz.webshare.addon.video.only", version: "1.3.0", name: "Webshare CZ (Video Only)", description: "Doplněk pro Webshare.cz s filtrem pro video soubory.", types: ["movie", "series"], catalogs: [], resources: ["stream"], idPrefixes: ["tt"] };
 const builder = new sdk.addonBuilder(manifest);
 
 builder.defineStreamHandler(async (args) => {
@@ -35,16 +35,34 @@ builder.defineStreamHandler(async (args) => {
         console.log(`Hledám: "${searchQuery}"`);
         const searchResponse = await axios.post('https://webshare.cz/api/search/', new URLSearchParams({ 'what': searchQuery, 'wst': wstToken }));
         const responseText = searchResponse.data;
-        const fileMatches = responseText.matchAll(/<file>([\s\S]*?)<\/file>/g);
-        if (!fileMatches) {
+        let allFileMatches = Array.from(responseText.matchAll(/<file>([\s\S]*?)<\/file>/g));
+
+        if (allFileMatches.length === 0) {
             console.log("Nenalezen žádný soubor.");
             return { streams: [] };
         }
 
-        const streamPromises = [];
-        const MAX_RESULTS = 10; // Můžeme si dovolit prohledat více souborů
+        // --- ZDE JE KLÍČOVÁ ÚPRAVA: FILTROVÁNÍ NECHTĚNÝCH SOUBORŮ ---
+        const unwantedExtensions = ['.srt', '.txt', '.nfo', '.sub', '.zip', '.rar'];
+        
+        const videoFileMatches = allFileMatches.filter(fileMatch => {
+            const fileBlock = fileMatch[1];
+            const nameMatch = fileBlock.match(/<name>\s*<!\[CDATA\[([\s\S]*?)]]>\s*<\/name>/) || fileBlock.match(/<name>(.*?)<\/name>/);
+            if (nameMatch && nameMatch[1]) {
+                const fileName = nameMatch[1].toLowerCase();
+                // Vrátíme `true` (ponecháme soubor) pouze pokud název nekončí na žádnou z nechtěných přípon
+                return !unwantedExtensions.some(ext => fileName.endsWith(ext));
+            }
+            return false; // Pokud se nepodaří najít název, pro jistotu soubor vyřadíme
+        });
+        
+        console.log(`Původně nalezeno ${allFileMatches.length} souborů, po odfiltrování titulků atd. zbylo ${videoFileMatches.length}.`);
+        // --- KONEC ÚPRAVY ---
 
-        for (const fileMatch of Array.from(fileMatches).slice(0, MAX_RESULTS)) {
+        const streamPromises = [];
+        const MAX_RESULTS = 10;
+
+        for (const fileMatch of videoFileMatches.slice(0, MAX_RESULTS)) {
             const fileBlock = fileMatch[1];
             const identMatch = fileBlock.match(/<ident>\s*(.*?)\s*<\/ident>/);
             const nameMatch = fileBlock.match(/<name>\s*<!\[CDATA\[([\s\S]*?)]]>\s*<\/name>/) || fileBlock.match(/<name>(.*?)<\/name>/);
@@ -66,17 +84,13 @@ builder.defineStreamHandler(async (args) => {
         let validStreams = resolvedStreams.filter(stream => stream !== null);
         console.log(`Úspěšně získano ${validStreams.length} streamů.`);
 
-        // --- ZDE JE KLÍČOVÁ ÚPRAVA: ŘAZENÍ VÝSLEDKŮ ---
         if (validStreams.length > 1) {
-            console.log(`Řadím ${validStreams.length} streamů, priorita pro 'cz'...`);
             validStreams.sort((a, b) => {
                 const aHasCz = a.title.toLowerCase().includes('cz');
                 const bHasCz = b.title.toLowerCase().includes('cz');
-                // Tímto jednoduchým trikem posuneme výsledky s 'cz' na začátek
                 return bHasCz - aHasCz;
             });
         }
-        // --- KONEC ÚPRAVY ---
 
         return { streams: validStreams };
 
@@ -93,6 +107,6 @@ const addonInterface = builder.getInterface();
 sdk.serveHTTP(addonInterface, { port: 7000 });
 
 console.log("=====================================================");
-console.log("DOPLNĚK BĚŽÍ S PRIORITOU PRO CZ ZDROJE");
+console.log("DOPLNĚK BĚŽÍ S FILTREM PRO VIDEO SOUBORY");
 console.log("http://127.0.0.1:7000/manifest.json");
 console.log("=====================================================");
