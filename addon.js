@@ -13,7 +13,7 @@ let wstToken = null;
 
 async function loginToWebshare() { if (wstToken) return true; try { console.log("Zahajuji přihlašování..."); const saltResponse = await axios.post('https://webshare.cz/api/salt/', new URLSearchParams({ 'username_or_email': WSHARE_USER })); const saltMatch = saltResponse.data.match(/<salt>(.*?)<\/salt>/); if (!saltMatch || !saltMatch[1]) throw new Error('Nepodařilo se získat sůl.'); const dynamicSalt = saltMatch[1]; const md5cryptedPassword = md5Crypt(WSHARE_PASSWORD, dynamicSalt); const sha1HashedPassword = crypto.createHash('sha1').update(md5cryptedPassword).digest('hex'); const digest = crypto.createHash('md5').update(`${WSHARE_USER}:Webshare:${WSHARE_PASSWORD}`).digest('hex'); const loginResponse = await axios.post('https://webshare.cz/api/login/', new URLSearchParams({ 'username_or_email': WSHARE_USER, 'password': sha1HashedPassword, 'digest': digest, 'keep_logged_in': '1' })); const tokenMatch = loginResponse.data.match(/<token>(.*?)<\/token>/); if (tokenMatch && tokenMatch[1]) { wstToken = tokenMatch[1]; console.log("✅ PŘIHLÁŠENÍ ÚSPĚŠNÉ!"); return true; } console.error("❌ Přihlášení selhalo.", loginResponse.data); return false; } catch (error) { console.error("❌ Kritická chyba při přihlašování:", error.message); return false; } }
 
-const manifest = { id: "cz.webshare.addon.multistream", version: "1.1.0", name: "Webshare CZ (Multi-Stream)", description: "Doplněk pro Webshare.cz s více výsledky.", types: ["movie", "series"], catalogs: [], resources: ["stream"], idPrefixes: ["tt"] };
+const manifest = { id: "cz.webshare.addon.cz.priority", version: "1.2.0", name: "Webshare CZ (CZ Priority)", description: "Doplněk pro Webshare.cz s prioritou pro CZ zdroje.", types: ["movie", "series"], catalogs: [], resources: ["stream"], idPrefixes: ["tt"] };
 const builder = new sdk.addonBuilder(manifest);
 
 builder.defineStreamHandler(async (args) => {
@@ -35,8 +35,6 @@ builder.defineStreamHandler(async (args) => {
         console.log(`Hledám: "${searchQuery}"`);
         const searchResponse = await axios.post('https://webshare.cz/api/search/', new URLSearchParams({ 'what': searchQuery, 'wst': wstToken }));
         const responseText = searchResponse.data;
-
-        // Najdeme VŠECHNY bloky <file> v odpovědi
         const fileMatches = responseText.matchAll(/<file>([\s\S]*?)<\/file>/g);
         if (!fileMatches) {
             console.log("Nenalezen žádný soubor.");
@@ -44,49 +42,41 @@ builder.defineStreamHandler(async (args) => {
         }
 
         const streamPromises = [];
-        const MAX_RESULTS = 5; // <<< ZDE MŮŽETE ZMĚNIT POČET ZOBRAZENÝCH VÝSLEDKŮ
+        const MAX_RESULTS = 10; // Můžeme si dovolit prohledat více souborů
 
-        // Zpracujeme každý nalezený soubor (až do limitu MAX_RESULTS)
         for (const fileMatch of Array.from(fileMatches).slice(0, MAX_RESULTS)) {
             const fileBlock = fileMatch[1];
             const identMatch = fileBlock.match(/<ident>\s*(.*?)\s*<\/ident>/);
             const nameMatch = fileBlock.match(/<name>\s*<!\[CDATA\[([\s\S]*?)]]>\s*<\/name>/) || fileBlock.match(/<name>(.*?)<\/name>/);
-
             if (identMatch && nameMatch) {
-                const fileIdent = identMatch[1];
-                const fileName = nameMatch[1];
-
-                // Přidáme "slib" (promise), že pro tento soubor získáme odkaz
                 streamPromises.push(
-                    axios.post('https://webshare.cz/api/file_link/', new URLSearchParams({ 'ident': fileIdent, 'wst': wstToken }))
+                    axios.post('https://webshare.cz/api/file_link/', new URLSearchParams({ 'ident': identMatch[1], 'wst': wstToken }))
                         .then(linkResponse => {
                             const linkMatch = linkResponse.data.match(/<link>\s*(.*?)\s*<\/link>/);
                             if (linkMatch && linkMatch[1]) {
-                                // Pokud se odkaz podaří získat, vrátíme objekt pro Stremio
-                                return {
-                                    title: `[WS] ${fileName.substring(0, 80)}`, // Přidáme prefix pro jasnou identifikaci
-                                    url: linkMatch[1]
-                                };
+                                return { title: `[WS] ${nameMatch[1]}`, url: linkMatch[1] };
                             }
-                            return null; // Pokud se odkaz nezíská, vrátíme null
-                        })
-                        .catch(err => {
-                            console.error(`Chyba při získávání odkazu pro ${fileName}:`, err.message);
-                            return null; // V případě chyby také vrátíme null
-                        })
+                            return null;
+                        }).catch(() => null)
                 );
             }
         }
-
-        console.log(`Zpracovávám ${streamPromises.length} nalezených souborů...`);
         
-        // Počkáme, až se všechny "sliby" dokončí
         const resolvedStreams = await Promise.all(streamPromises);
-
-        // Odfiltrujeme neúspěšné pokusy (ty, které vrátily null)
-        const validStreams = resolvedStreams.filter(stream => stream !== null);
-
+        let validStreams = resolvedStreams.filter(stream => stream !== null);
         console.log(`Úspěšně získano ${validStreams.length} streamů.`);
+
+        // --- ZDE JE KLÍČOVÁ ÚPRAVA: ŘAZENÍ VÝSLEDKŮ ---
+        if (validStreams.length > 1) {
+            console.log(`Řadím ${validStreams.length} streamů, priorita pro 'cz'...`);
+            validStreams.sort((a, b) => {
+                const aHasCz = a.title.toLowerCase().includes('cz');
+                const bHasCz = b.title.toLowerCase().includes('cz');
+                // Tímto jednoduchým trikem posuneme výsledky s 'cz' na začátek
+                return bHasCz - aHasCz;
+            });
+        }
+        // --- KONEC ÚPRAVY ---
 
         return { streams: validStreams };
 
@@ -103,6 +93,6 @@ const addonInterface = builder.getInterface();
 sdk.serveHTTP(addonInterface, { port: 7000 });
 
 console.log("=====================================================");
-console.log("DOPLNĚK BĚŽÍ S PODPOROU VÍCE STREAMŮ");
+console.log("DOPLNĚK BĚŽÍ S PRIORITOU PRO CZ ZDROJE");
 console.log("http://127.0.0.1:7000/manifest.json");
 console.log("=====================================================");
