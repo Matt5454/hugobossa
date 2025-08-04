@@ -1,17 +1,13 @@
 const sdk = require("stremio-addon-sdk");
 const axios = require('axios');
 const crypto = require('crypto');
-
 // =================================================================
 // PŘIHLAŠOVACÍ ÚDAJE JSOU NYNÍ ZADÁVÁNY UŽIVATELEM PŘI INSTALACI
 // =================================================================
-
 // Funkce pro MD5 šifrování zůstává beze změny
 function md5Crypt(password, salt) { let magic = '$1$'; if (salt.indexOf(magic) === 0) { salt = salt.substring(magic.length, salt.indexOf('$', magic.length)); } else { salt = salt.substring(0, 8); } let final = magic + salt + '$'; let ctx = crypto.createHash('md5'); ctx.update(password + magic + salt); let altCtx = crypto.createHash('md5'); altCtx.update(password + salt + password); let altResult = altCtx.digest(); for (let i = 0; i < password.length; i++) { ctx.update(altResult.subarray(i % 16, i % 16 + 1)); } for (let i = password.length; i !== 0; i >>= 1) { if ((i & 1) !== 0) { ctx.update(Buffer.from([0])); } else { ctx.update(password.charAt(0)); } } let result = ctx.digest(); for (let i = 0; i < 1000; i++) { ctx = crypto.createHash('md5'); if ((i & 1) !== 0) { ctx.update(password); } else { ctx.update(result); } if ((i % 3) !== 0) { ctx.update(salt); } if ((i % 7) !== 0) { ctx.update(password); } if ((i & 1) !== 0) { ctx.update(result); } else { ctx.update(password); } result = ctx.digest(); } const to64 = (n, c) => { const chars = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'; let s = ''; for (let i = 0; i < c; i++) { s += chars[n & 0x3f]; n >>>= 6; } return s; }; let l = (result[0] << 16) | (result[6] << 8) | result[12]; final += to64(l, 4); l = (result[1] << 16) | (result[7] << 8) | result[13]; final += to64(l, 4); l = (result[2] << 16) | (result[8] << 8) | result[14]; final += to64(l, 4); l = (result[3] << 16) | (result[9] << 8) | result[15]; final += to64(l, 4); l = (result[4] << 16) | (result[10] << 8) | result[5]; final += to64(l, 4); l = result[11]; final += to64(l, 2); return final; }
-
 // UPRAVENO: Místo jednoho globálního tokenu používáme cache pro případ více uživatelů
 const tokenCache = {};
-
 // UPRAVENO: Funkce nyní přijímá jméno a heslo jako argumenty
 async function loginToWebshare(username, password) {
     try {
@@ -38,13 +34,20 @@ async function loginToWebshare(username, password) {
         return null;
     }
 }
-
+// Funkce pro formátování velikosti souboru
+function formatFileSize(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
 // UPRAVENO: Manifest nyní obsahuje sekci 'config' pro zadání údajů
 const manifest = {
     id: "cz.webshare.addon.video.only.configurable",
     version: "2.0.0",
     name: "Webshare CZ (Video Only)",
-    description: "Doplněk pro Webshare.cz s filtrem pro video soubory. Vyžaduje zadání přihlašovacích údajů.",
+    description: "Doplněk pro Webshare.cz s filtrem pro video soubory. Zobrazuje velikost souborů a hodnocení.",
     types: ["movie", "series"],
     catalogs: [],
     resources: ["stream"],
@@ -68,9 +71,7 @@ const manifest = {
         }
     ]
 };
-
 const builder = new sdk.addonBuilder(manifest);
-
 // UPRAVENO: Handler nyní pracuje s `args.config` a cacheovaným tokenem
 builder.defineStreamHandler(async (args) => {
     // Získáme údaje zadané uživatelem
@@ -79,16 +80,13 @@ builder.defineStreamHandler(async (args) => {
         console.log("Chybí přihlašovací údaje v konfiguraci doplňku.");
         return Promise.resolve({ streams: [] });
     }
-
     let wstToken = tokenCache[username];
-
     if (!wstToken) {
         wstToken = await loginToWebshare(username, password);
         if (!wstToken) {
             return { streams: [] }; // Přihlášení selhalo
         }
     }
-
     try {
         let searchQuery;
         if (args.type === 'movie') {
@@ -99,17 +97,14 @@ builder.defineStreamHandler(async (args) => {
             const meta = await axios.get(`https://v3-cinemeta.strem.io/meta/series/${imdbId}.json`);
             searchQuery = `${meta.data.meta.name} S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
         }
-
         console.log(`Hledám: "${searchQuery}"`);
         const searchResponse = await axios.post('https://webshare.cz/api/search/', new URLSearchParams({ 'what': searchQuery, 'wst': wstToken }));
         const responseText = searchResponse.data;
         let allFileMatches = Array.from(responseText.matchAll(/<file>([\s\S]*?)<\/file>/g));
-
         if (allFileMatches.length === 0) {
             console.log("Nenalezen žádný soubor.");
             return { streams: [] };
         }
-
         const unwantedExtensions = ['.srt', '.txt', '.nfo', '.sub', '.zip', '.rar'];
         const videoFileMatches = allFileMatches.filter(fileMatch => {
             const fileBlock = fileMatch[1];
@@ -120,34 +115,50 @@ builder.defineStreamHandler(async (args) => {
             }
             return false;
         });
-
         console.log(`Původně nalezeno ${allFileMatches.length} souborů, po odfiltrování titulků atd. zbylo ${videoFileMatches.length}.`);
-
         const streamPromises = [];
         const MAX_RESULTS = 10;
-
         for (const fileMatch of videoFileMatches.slice(0, MAX_RESULTS)) {
             const fileBlock = fileMatch[1];
             const identMatch = fileBlock.match(/<ident>\s*(.*?)\s*<\/ident>/);
             const nameMatch = fileBlock.match(/<name>\s*<!\[CDATA\[([\s\S]*?)]]>\s*<\/name>/) || fileBlock.match(/<name>(.*?)<\/name>/);
             if (identMatch && nameMatch) {
                 streamPromises.push(
-                    axios.post('https://webshare.cz/api/file_link/', new URLSearchParams({ 'ident': identMatch[1], 'wst': wstToken }))
-                        .then(linkResponse => {
+                    (async () => {
+                        try {
+                            // Získání informací o souboru (velikost a hodnocení)
+                            const fileInfoResponse = await axios.post('https://webshare.cz/api/file_info/', new URLSearchParams({ 'ident': identMatch[1], 'wst': wstToken }));
+                            const sizeMatch = fileInfoResponse.data.match(/<size>(.*?)<\/size>/);
+                            const positiveMatch = fileInfoResponse.data.match(/<positive>(.*?)<\/positive>/);
+                            const negativeMatch = fileInfoResponse.data.match(/<negative>(.*?)<\/negative>/);
+                            
+                            const fileSize = sizeMatch ? parseInt(sizeMatch[1]) : 0;
+                            const positiveVotes = positiveMatch ? parseInt(positiveMatch[1]) : 0;
+                            const negativeVotes = negativeMatch ? parseInt(negativeMatch[1]) : 0;
+                            
+                            // Získání download linku
+                            const linkResponse = await axios.post('https://webshare.cz/api/file_link/', new URLSearchParams({ 'ident': identMatch[1], 'wst': wstToken }));
                             const linkMatch = linkResponse.data.match(/<link>\s*(.*?)\s*<\/link>/);
+                            
                             if (linkMatch && linkMatch[1]) {
-                                return { title: `[WS] ${nameMatch[1]}`, url: linkMatch[1] };
+                                // Vytvoření titulku s velikostí a hodnocením
+                                const ratingText = positiveVotes > 0 || negativeVotes > 0 ? ` 👍 ${positiveVotes} 👎 ${negativeVotes}` : '';
+                                const sizeText = fileSize > 0 ? ` (${formatFileSize(fileSize)})` : '';
+                                const title = `[WS] ${nameMatch[1]}${sizeText}${ratingText}`;
+                                return { title: title, url: linkMatch[1] };
                             }
                             return null;
-                        }).catch(() => null)
+                        } catch (error) {
+                            console.error(`Chyba při zpracování souboru ${nameMatch[1]}:`, error.message);
+                            return null;
+                        }
+                    })()
                 );
             }
         }
-
         const resolvedStreams = await Promise.all(streamPromises);
         let validStreams = resolvedStreams.filter(stream => stream !== null);
         console.log(`Úspěšně získano ${validStreams.length} streamů.`);
-
         if (validStreams.length > 1) {
             validStreams.sort((a, b) => {
                 const aHasCz = a.title.toLowerCase().includes('cz');
@@ -155,9 +166,7 @@ builder.defineStreamHandler(async (args) => {
                 return bHasCz - aHasCz;
             });
         }
-
         return { streams: validStreams };
-
     } catch (error) {
         console.error("Nastala kritická chyba v handleru streamů:", error.message);
         // Pokud je chyba kvůli neplatnému tokenu, smažeme ho z cache, aby se při příštím pokusu vynutilo nové přihlášení
@@ -167,12 +176,10 @@ builder.defineStreamHandler(async (args) => {
         return { streams: [] };
     }
 });
-
 const addonInterface = builder.getInterface();
 const PORT = process.env.PORT || 7000;
 sdk.serveHTTP(addonInterface, { port: PORT });
-
 console.log("=====================================================");
-console.log("DOPLNĚK BĚŽÍ S FILTREM PRO VIDEO SOUBORY A KONFIGURACÍ");
+console.log("DOPLNĚK BĚŽÍ S FILTREM PRO VIDEO SOUBORY, KONFIGURACÍ A ZOBRAZENÍM VELIKOSTI A HODNOCENÍ");
 console.log(`http://127.0.0.1:${PORT}/manifest.json`);
 console.log("=====================================================");
